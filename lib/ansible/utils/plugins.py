@@ -220,7 +220,8 @@ connection_loader = PluginLoader(
     'ansible.runner.connection_plugins',
     C.DEFAULT_CONNECTION_PLUGIN_PATH,
     'connection_plugins',
-    aliases={'paramiko': 'paramiko_ssh'}
+    aliases={'paramiko': 'paramiko_ssh',
+             'paramiko_switch': 'paramiko_switch'}
 )
 
 shell_loader = PluginLoader(

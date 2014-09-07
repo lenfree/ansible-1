@@ -1,0 +1,592 @@
+#!/usr/bin/python
+#coding: utf-8 -*-
+
+# (c) 2014, Patrick Galbraith <patg@patg.net>
+#
+# This file is part of Ansible
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: hpswitch
+version_added: 0.1
+author: Patrick Galbraith
+short_description: Basic management of HP 1910 24GB Comware-based 5.x Switches
+requirements: [ paramiko ]
+description:
+    - Basic management of HP 1910 24GB HP Comware-based Switches
+options:
+    developer-mode:
+        required: false
+        default: true
+        choices: [ true, false ]
+        description:
+            - Whether to set the switch into developer mode.
+    state:
+        required: false
+        default: present
+        choices: [ 'present', 'reboot' ]
+    host:
+        required: true
+        default: empty
+        description:
+            - host/ip of switch
+    username:
+        required: true
+        default: empty
+        description:
+            - username to connect to switch as
+    password:
+        required: true
+        default: empty
+        description:
+            - password to connect switch with
+    timeout:
+        required: false
+        default: 30
+        description:
+            - How long to wait for switch to respond
+'''
+
+EXAMPLES = '''
+
+# file: switch.yml
+- hosts: localhost
+  tasks:
+  - name: get facts for the switch
+    local_action:
+      module: hpswitch_facts
+      developer-mode: true
+      host: 192.168.1.100
+      username: admin
+      password: ckrit
+
+# OR
+
+# file: switch.yml
+- hosts: localhost
+  tasks:
+  - name: gather facts from switch
+    hpswitch: host=192.168.1.100 username=admin password=ckrit
+
+'''
+
+import re
+import pprint
+import paramiko
+from ansible.module_utils.basic import *
+import traceback
+from ansible import errors
+from ansible import utils
+from ansible.callbacks import vvv, vvvv, verbose
+cmd_quit = "quit\n"
+cmd_disable_paging = "screen-length disable\n"
+cmd_line_mode = "_cmdline-mode on\n"
+cmd_yes = "Y\n"
+cmd_no = "N\n"
+cmd_line_mode_resp = "%s512900\n" % cmd_yes
+cmd_summary = "summary\n"
+cmd_save = "save\n"
+cmd_system_view = "system-view\n"
+cmd_current_config = "display current-configuration\n"
+cmd_reboot = "reboot\n"
+cmd_display_vlan_all = "display vlan all\n"
+
+verify_save_current_conf = \
+    'Current configuration will be lost, save current configuration'
+verify_filename = 'Please input the file name'
+verify_filename_unchanged = 'To leave existing filename unchanged'
+verify_config_file_saved = 'Configuration is saved to device successfully'
+verify_reboot = 'This command will reboot the device'
+
+top_level_prompt = "<HP>"
+sys_prompt = '[HP]'
+sys_prompt_regex = '\[HP\]'
+
+#paramiko.util.log_to_file('/tmp/ansible_paramiko.log')
+pp = pprint.PrettyPrinter(indent=4)
+l = open('/tmp/debug_hpswitch_facts.txt', "w+")
+l.write("begin log\n")
+
+
+class HPSwitch(object):
+    def __init__(self, module):
+        self.module = module
+        self._failed = False
+        self._changed = False
+        self._message = ""
+        self.timeout = module.params['timeout']
+        self._developer_mode_set = False
+        self._system_view = False
+        self._top_level_view = False
+        self._paging_disabled = False
+        self._port = 22
+
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        vvv("HOST: %s" % module.params.get('host'))
+        l.write("connecting to host %s\n" % module.params.get('host'))
+        try:
+            ssh.connect(module.params.get('host'),
+                        username=module.params.get('username'),
+                        password=module.params.get('password'),
+                        allow_agent=False,
+                        look_for_keys=False,
+                        timeout=module.params.get('timeout'))
+        # TODO: more specific error-handling (?)
+        except Exception, e:
+            msg = str(e)
+            self.module.exit_json(failed=True,
+                                  changed=False,
+                                  msg=msg)
+
+        l.write("connected to host %s\n" % module.params.get('host'))
+        self._top_level_view = True
+
+        self.ssh = ssh
+        try:
+            self.channel = ssh.invoke_shell()
+        except Exception, e:
+            msg = str(e)
+            self.module.exit_json(failed=True,
+                                  changed=False,
+                                  msg=msg)
+
+        if module.params.get('timeout'):
+            self.channel.settimeout(module.params.get('timeout'))
+
+    def get_failed(self):
+        return self._failed
+
+    def get_changed(self):
+        return self._changed
+
+    def get_message(self):
+        return self._message
+
+    def set_failed(self, state):
+        self._failed = state
+
+    def set_changed(self, state):
+        self._changed = state
+
+    def set_message(self, message):
+        self._message = message
+
+    def append_message(self, message):
+        self._message += message
+
+    def _developer_mode(self):
+        error_message = "ERROR: Unable to switch to developer mode"
+        self._send_command(cmd_line_mode, error_message)
+        error_message = "ERROR: Unable to send dev mode password"
+        self._send_command(cmd_line_mode_resp, error_message)
+        self._developer_mode_set = True
+
+    def _send_command(self, command, message=""):
+        try:
+            self.channel.send(command)
+        except Exception, e:
+            message = message + " %s %s" % e.__class__, e
+            self.module.exit_json(failed=True,
+                                  changed=False,
+                                  msg=message)
+
+    def save(self):
+        cmd_confirm = cmd_no
+        if self.module.params.get('save') is True:
+            cmd_confirm = cmd_yes
+
+        cmd_file_name = "\n"
+        if self.module.params.get('startup_cfg'):
+            cmd_file_name = "flash:/" + self.module.params.get('startup_cfg') \
+                            + cmd_file_name
+        self._send_command(cmd_save, "ERROR: unable to save config")
+        self._send_command(cmd_confirm, "ERROR: unable to save config")
+        self._send_command(cmd_file_name, "ERROR: unable to save %s"
+                           % cmd_file_name)
+        self._developer_mode_set = True
+
+    def _quit(self):
+        self._send_command(cmd_quit, "ERROR: unable to quit level")
+
+    def _ensure_top_level_view(self):
+        if self._is_system_view() is True:
+            try:
+                l.write('sending cmd_quit, in system view\n')
+                self._quit()
+                self._top_level_view = True
+                self._system_view = False
+            except Exception:
+                error = ''
+                self.module.exit_json(failed=True,
+                                      changed=False,
+                                      msg=
+                                      "Error: %s unable to exit system-view"
+                                      % error)
+
+    def _disable_paging(self):
+        self._send_command(cmd_disable_paging,
+                           "ERROR: unable to disable paging")
+        self._paging_disabled = True
+
+    def _get_output(self, start, end=""):
+        l.write("_get_output()\n")
+        output_buf = ""
+        append_flag = False
+        expect_end = False
+        while True:
+            read_buf = self.channel.recv(1024)
+            read_buf = read_buf.replace("\r", "")
+            l.write("%s" % read_buf)
+            l.flush()
+
+            if start in read_buf:
+                expect_end = True
+                append_flag = True
+
+            if append_flag:
+                output_buf += read_buf
+
+            if end == "":
+                end = '(' + top_level_prompt + '|' + sys_prompt_regex + ')'
+            if re.match('.*\n' + end + '$', read_buf, re.DOTALL) \
+               and expect_end:
+                break
+
+        return output_buf
+
+    def _get_output_list(self, start, end, keep_prompt=False):
+        l.write("_get_output_list() calling get_output()\n")
+        l.flush()
+        output_buf = self._get_output(start)
+
+        output_list = output_buf.split('\n')
+        list_length = len(output_list)
+        if not keep_prompt:
+            list_length -= 1
+        l.write("list_length %d\n" % list_length)
+        l.write(pp.pformat(output_list))
+        l.flush()
+
+        return output_list[0:list_length]
+
+    def _get_summary(self):
+        summary_start = "Select menu option:             Summary"
+        self._ensure_top_level_view()
+        self._send_command(cmd_summary, "ERROR: unable to get switch summary")
+        summary_buf = self._get_output(summary_start, top_level_prompt)
+        summary_dict = self._get_summary_dict(summary_buf)
+        return summary_dict
+
+    # get a clean dictionary representation of summary output for facts
+    def _get_summary_dict(self, summary_buf=''):
+        summary_dict = {}
+        summary_list = summary_buf.split('\n')
+        line_count = 0
+        for item in summary_list:
+            m = re.search('^([\s\w]+):\s*(\w.*)$', item)
+            if m:
+                key = m.group(1)
+                value = m.group(2)
+                key = key.replace(' ', '_')
+                summary_dict[key] = value
+            m = re.search('HP .* Software', item)
+            if m:
+                summary_dict['software_version'] = summary_list[line_count + 1]
+                summary_dict['software_copyright'] = \
+                    summary_list[line_count + 2]
+                summary_dict['uptime'] = summary_list[line_count + 3]
+                summary_dict['model'] = summary_list[line_count + 4]
+                summary_dict['memory_dram'] = summary_list[line_count + 6]
+                summary_dict['memory_flash'] = summary_list[line_count + 7]
+                summary_dict['memory_register'] = summary_list[line_count + 8]
+                summary_dict['hardware_version'] = \
+                    summary_list[line_count + 10]
+                summary_dict['cpld_version'] = summary_list[line_count + 11]
+                summary_dict['bootrom_version'] = summary_list[line_count + 12]
+                summary_dict['subslot_0'] = summary_list[line_count + 13]
+                break
+
+            line_count += 1
+
+        return summary_dict
+
+    def _run_current_config(self):
+        self._set_system_view()
+        self._send_command(cmd_current_config,
+                           "ERROR: unable to get switch current config")
+
+    # get a clean dictionary representation of current config output for facts
+    # TODO: work into a dict with specific parsing phrases. No easy way
+    # to do this!
+    def _get_current_config(self):
+        self._run_current_config()
+        return self._get_config_dict(self._get_config_list())
+
+    def _get_config_list(self):
+        return self._get_output_list('version',
+                                     sys_prompt_regex)
+
+    def _get_config_dict(self, config_list):
+        keywords = ['sysname',
+                    'ftp server',
+                    'domain default',
+                    'telnet server',
+                    'ip ttl-expires',
+                    'password-recovery',
+                    'user-group']
+        local_user_keywords = ['password cipher',
+                               'authorization-attribute',
+                               'service-type']
+        interface_keywords = ['stp edged-port', 'port access']
+        config_dict = {'sysname': 'HP',
+                       'interfaces': {},
+                       'vlans': {},
+                       'local-user': {}}
+        # OK, maybe this has some duplication, but parsing through
+        # current-configuration is somewhat tricky.
+        # TODO: break into methods and make generic as possible
+        i = 0
+        for line in config_list:
+            for keyword in keywords:
+                if keyword in line:
+                    m = re.search(keyword + " (.*)$", line, re.DOTALL)
+                    if m and len(m.group(1)):
+                        value = m.group(1)
+                        config_dict[keyword] = value
+            m = re.search('^interface ([\w\-\/]+)$', line, re.DOTALL)
+            if m and len(m.group(1)):
+                interface = m.group(1)
+                config_dict['interfaces'][interface] = {}
+                for iline in config_list[i:len(config_list)]:
+                    if re.match('^#$', iline):
+                        break
+                    for key in interface_keywords:
+                        m = re.search('^\s' + key + '(.*)$', iline)
+                        if m and len(m.group(1)):
+                            value = m.group(1)
+                            config_dict['interfaces'][interface][key] = value
+            m = re.search('^vlan ([\w\-\/]+)$', line, re.DOTALL)
+            if m and len(m.group(1)):
+                vlan_id = m.group(1)
+                config_dict['vlans'][vlan_id] = {}
+                for iline in config_list[i:len(config_list)]:
+                    if re.match('^#$', iline):
+                        break
+                    m = re.search('^\sname (\w+)$', iline)
+                    if m and len(m.group(1)):
+                        name = m.group(1)
+                        config_dict['vlans'][vlan_id]['name'] = name
+            m = re.search('^local-user ([\w\-\/]+)$', line, re.DOTALL)
+            if m and len(m.group(1)):
+                user_id = m.group(1)
+                config_dict['local-user'][user_id] = {}
+                # something to collect services that are enabled
+                services_enabled = []
+                for iline in config_list[i:len(config_list)]:
+                    if re.match('^#$', iline):
+                        break
+                    # possible output following 'local-user'
+                    for key in local_user_keywords:
+                        m = re.search('^\s?' + key + ' (.*)$', iline)
+                        if m and len(m.group(1)):
+                            value = m.group(1)
+                            # array members - thus far
+                            if key == 'service-type':
+                                services_enabled += value.split()
+                            else:
+                                config_dict['local-user'][user_id][key] = value
+                config_dict['local-user'][user_id]['service-type'] =\
+                    services_enabled
+            i += 1
+
+        self._quit()
+        return config_dict
+
+    def _get_prompt(self):
+        self._send_command("\n")
+        self._send_command("\n")
+        prompt_list = self._get_output_list('HP', '', keep_prompt=True)
+        l.write("get_prompt() %s\n" % prompt_list[len(prompt_list) - 1])
+        l.flush()
+        return prompt_list[len(prompt_list) - 1]
+
+    def _get_vlans(self):
+        vlan_buf_list = []
+        vlan_id = 0
+        vlan_dict = {}
+        ports_collect = False
+        key = ''
+
+        self._set_system_view()
+        self._send_command(cmd_display_vlan_all,
+                           "ERROR: unable to get switch current config")
+        vlan_buf_list = self._get_output_list('VLAN ID:',
+                                              top_level_prompt)
+        for line in vlan_buf_list:
+            # crud, skip it
+            if line == ' ' or sys_prompt in line:
+                l.write("%s\n" % line)
+                next
+            # in case this shows up
+            if re.match('^' + sys_prompt_regex + '$', line, re.DOTALL):
+                break
+            # get the ID
+            m = re.search('^\sVLAN ID:\s(\d+)', line, re.DOTALL)
+            if m:
+                vlan_id = m.group(1)
+                vlan_dict[vlan_id] = {}
+                next
+
+            # get the rest
+            m = re.search('^\s([\w\s]+):\s?(\w[\w\s\.]+)?', line, re.DOTALL)
+            if m:
+                ports_collect = False
+                key = re.sub('\s+', '_', m.group(1))
+                if m.group(2):
+                    vlan_dict[vlan_id][key] = m.group(2)
+                # if 'Ports' and no group(2), that means follow lines
+                # will contain the ports for that VPN, start collecting
+                elif 'Ports' in key:
+                    vlan_dict[vlan_id][key] = []
+                    ports_collect = True
+
+            # if collecting ports, just split and append to array
+            elif ports_collect:
+                ports_list = line.split()
+                vlan_dict[vlan_id][key] += ports_list
+
+        return vlan_dict
+
+    def get_facts(self):
+        facts = {}
+        if not self.module.params.get('gather_facts'):
+            return facts
+        # developer_mode = self.module.params.get('developer-mode')
+        self.dev_setup()
+        facts['summary'] = self._get_summary()
+        facts['current_config'] = self._get_current_config()
+        facts['vlans'] = self._get_vlans()
+
+        return facts
+
+    def dev_setup(self):
+        if not self._developer_mode_set:
+            self._developer_mode()
+        if not self._paging_disabled:
+            self._disable_paging()
+
+    def _is_system_view(self):
+        if self._system_view:
+            return self._system_view
+        prompt = self._get_prompt()
+        if prompt == sys_prompt:
+            l.write('system_view_set = True\n')
+            self._system_view = True
+            return true
+
+    def _set_system_view(self):
+        self._send_command("\n")
+
+        while True:
+            read_buf = self.channel.recv(1024)
+            read_buf = read_buf.replace("\r", "")
+            if re.match('.*\n(' + sys_prompt_regex + '|'
+                        + top_level_prompt + ')$', read_buf, re.DOTALL):
+                break
+
+        if re.match('.*\n' + top_level_prompt + '$', read_buf, re.DOTALL):
+            self._send_command(cmd_system_view,
+                               "ERROR: unable to enter system-view")
+        self._system_view = True
+
+    def dispatch(self):
+        facts = self.get_facts()
+        state = self.module.params.get('state')
+        if state == 'reboot':
+            self.reboot()
+        return facts
+
+    def reboot(self):
+        self.dev_setup()
+        l.write("reboot()\n")
+        l.flush()
+
+        self._ensure_top_level_view()
+        prompt = self._get_prompt()
+        l.write("reboot() prompt: %s\n" % prompt)
+
+        self._send_command(cmd_reboot, "ERROR: Unable to reboot")
+        while True:
+            read_buf = self.channel.recv(1024)
+            read_buf = read_buf.replace("\r", "")
+            l.write("%s" % read_buf)
+            l.flush()
+            if verify_save_current_conf in read_buf:
+                if self.module.params.get('save') is True:
+                    #l.write("save config: yes\n")
+                    self._send_command(cmd_yes)
+                else:
+                    #l.write("save config: no\n")
+                    self._send_command(cmd_no)
+                    read_buf = self.channel.recv(1024)
+                    read_buf = read_buf.replace("\r", "")
+            if verify_reboot in read_buf:
+                l.write("rebooting\n")
+                self._send_command(cmd_yes)
+                break
+
+        self.append_message("Please wait for the switch to resume... ")
+        self.append_message("Rebooting.")
+        self._changed = True
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            developer_mode=dict(type='bool'),
+            state=dict(required=False, default='present',
+                       choices=['present', 'reboot']),
+            save=dict(required=False, type='bool', default=False),
+            username=dict(required=True),
+            password=dict(required=True),
+            host=dict(required=True),
+            gather_facts=dict(required=False, type='bool', default='True'),
+            timeout=dict(default=30, type='int')
+        ),
+        supports_check_mode=True,
+    )
+
+    failed = False
+
+    switch = HPSwitch(module)
+
+    try:
+        facts = switch.dispatch()
+
+        module.exit_json(failed=failed,
+                         changed=switch.get_changed(),
+                         msg=switch.get_message(),
+                         ansible_facts=facts)
+    except Exception, e:
+        module.exit_json(failed=switch.get_failed(),
+                         changed=switch.get_changed(),
+                         msg=switch.get_message() + repr(e))
+
+# import module snippets
+main()
+l.close()
