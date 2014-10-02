@@ -86,8 +86,9 @@ EXAMPLES = '''
 import re
 import pprint
 import paramiko
-from ansible.module_utils.basic import *
 import traceback
+from ansible.module_utils.basic import *
+from ansible import constants as C
 from ansible import errors
 from ansible import utils
 from ansible.callbacks import vvv, vvvv, verbose
@@ -122,30 +123,57 @@ l.write("begin log\n")
 
 
 class HPSwitch(object):
-    def __init__(self, module):
+    def __init__(self,
+                 module,
+                 username,
+                 password,
+                 host,
+                 timeout,
+                 port=22,
+                 private_key_file=None):
         self.module = module
+        self.host = host
+        self.username = username
+        self.password = password
+        self.port = port
+        self.private_key_file = private_key_file
+        self.timeout = timeout
         self._failed = False
         self._changed = False
         self._message = ""
-        self.timeout = module.params['timeout']
         self._developer_mode_set = False
         self._system_view = False
         self._top_level_view = False
         self._paging_disabled = False
-        self._port = 22
 
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         vvv("HOST: %s" % module.params.get('host'))
         l.write("connecting to host %s\n" % module.params.get('host'))
+        if self.private_key_file is not None:
+            self.keyfile = os.path.expanduser("~/.ssh/known_hosts")
+
+        if C.HOST_KEY_CHECKING:
+            ssh.load_system_host_keys()
+
+        if self.private_key_file:
+            key_filename = os.path.expanduser(self.private_key_file)
+        else:
+            key_filename = None
+
+        allow_agent = True
+        if self.password is not None:
+            allow_agent = False
+
         try:
-            ssh.connect(module.params.get('host'),
-                        username=module.params.get('username'),
-                        password=module.params.get('password'),
-                        allow_agent=False,
+            ssh.connect(self.host,
+                        username=self.username,
+                        password=self.password,
+                        key_filename=key_filename,
+                        allow_agent=allow_agent,
                         look_for_keys=False,
-                        timeout=module.params.get('timeout'))
+                        timeout=self.timeout)
         # TODO: more specific error-handling (?)
         except Exception, e:
             msg = str(e)
@@ -566,14 +594,22 @@ def main():
             password=dict(required=True),
             host=dict(required=True),
             gather_facts=dict(required=False, type='bool', default='True'),
-            timeout=dict(default=30, type='int')
+            timeout=dict(default=30, type='int'),
+            port=dict(default=22, type='int'),
+            private_key_file=dict(required=False)
         ),
         supports_check_mode=True,
     )
 
     failed = False
 
-    switch = HPSwitch(module)
+    switch = HPSwitch(module,
+                      host=module.params.get('host'),
+                      username=module.params.get('username'),
+                      password=module.params.get('password'),
+                      timeout=module.params.get('timeout'),
+                      port=module.params.get('port'),
+                      private_key_file=module.params.get('private_key_file'))
 
     try:
         facts = switch.dispatch()
