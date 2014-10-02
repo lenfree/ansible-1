@@ -153,14 +153,12 @@ class HPSwitch(object):
         l.write("connecting to host %s\n" % module.params.get('host'))
         if self.private_key_file is not None:
             self.keyfile = os.path.expanduser("~/.ssh/known_hosts")
-
-        if C.HOST_KEY_CHECKING:
-            ssh.load_system_host_keys()
-
-        if self.private_key_file:
             key_filename = os.path.expanduser(self.private_key_file)
         else:
             key_filename = None
+
+        if C.HOST_KEY_CHECKING:
+            ssh.load_system_host_keys()
 
         allow_agent = True
         if self.password is not None:
@@ -591,7 +589,7 @@ def main():
                        choices=['present', 'reboot']),
             save=dict(required=False, type='bool', default=False),
             username=dict(required=True),
-            password=dict(required=True),
+            password=dict(required=False),
             host=dict(required=True),
             gather_facts=dict(required=False, type='bool', default='True'),
             timeout=dict(default=30, type='int'),
@@ -603,6 +601,14 @@ def main():
 
     failed = False
 
+    if module.params.get('private_key_file') is None \
+       and module.params.get('password') is None:
+        err_msg = "No password or private_key_file provided. " +\
+                  "Either one must be supplied!"
+        module.exit_json(failed=True,
+                         changed=False,
+                         msg=err_msg,
+                         ansible_facts={})
     switch = HPSwitch(module,
                       host=module.params.get('host'),
                       username=module.params.get('username'),
